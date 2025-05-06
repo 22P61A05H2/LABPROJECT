@@ -1,17 +1,10 @@
 from openai import OpenAI
-import re
-from PIL import Image
 import os
-import torch
-import torchvision.transforms as transforms
-import torchvision.models as models
-import requests
-import json
+import easyocr  # Import the easyocr library
+from datetime import datetime
 from geopy.geocoders import Nominatim
 from geopy.exc import GeocoderTimedOut, GeocoderServiceError
-import speech_recognition as sr
-from datetime import datetime
-import easyocr  # Import the easyocr library
+import json  # Import the json library for debugging API response
 
 client = OpenAI(
     base_url="https://openrouter.ai/api/v1",
@@ -29,79 +22,9 @@ except Exception as e:
 # Initialize geolocator
 geolocator = Nominatim(user_agent="multimedia_report_generator")
 
-# Load pre-trained model and labels ONCE
-model = None
-transform = None
-imagenet_classes = []
-try:
-    model = models.resnet18(pretrained=True)
-    model.eval()
-    transform = transforms.Compose([
-        transforms.Resize(256),
-        transforms.CenterCrop(224),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ])
-    try:
-        with open("imagenet_classes.txt", "r") as f:
-            imagenet_classes = [s.strip() for s in f.readlines()]
-    except FileNotFoundError:
-        print("Warning: imagenet_classes.txt not found. Downloading...")
-        url = "https://raw.githubusercontent.com/anishathalye/imagenet-simple-labels/master/imagenet-simple-labels.json"
-        try:
-            response = requests.get(url)
-            response.raise_for_status()
-            imagenet_labels_json = response.json()
-            if isinstance(imagenet_labels_json, dict):
-                imagenet_classes = list(imagenet_labels_json.values())
-            elif isinstance(imagenet_labels_json, list):
-                imagenet_classes = imagenet_labels_json
-            else:
-                print("Error: Unexpected format for downloaded ImageNet labels.")
-                imagenet_classes = ["unknown"] * 1000
-            with open("imagenet_classes.txt", "w") as f:
-                for label in imagenet_classes:
-                    f.write(label + "\n")
-        except requests.exceptions.RequestException as e:
-            print(f"Error downloading ImageNet labels: {e}")
-            imagenet_classes = ["unknown"] * 1000
-        except json.JSONDecodeError as e:
-            print(f"Error decoding downloaded JSON: {e}")
-            imagenet_classes = ["unknown"] * 1000
-    except Exception as e:
-        print(f"Error loading ImageNet class labels: {e}")
-        imagenet_classes = ["unknown"] * 1000
-except Exception as e:
-    print(f"Error initializing PyTorch models or transforms: {e}")
-    model = None
-    transform = None
-    imagenet_classes = ["Error"] * 1000
-
-def process_image_objects(image_path):
-    if model is None or transform is None or not imagenet_classes or "Error" in imagenet_classes:
-        return "Error: PyTorch model or dependencies not initialized correctly."
-    try:
-        img = Image.open(image_path).convert('RGB')
-        img_t = transform(img)
-        batch_t = torch.unsqueeze(img_t, 0)
-
-        with torch.no_grad():
-            output = model(batch_t)
-
-        _, indices = torch.sort(output, descending=True)
-        probabilities = torch.nn.functional.softmax(output, dim=1)[0]
-
-        top5_preds = [(imagenet_classes[idx], probabilities[idx].item() * 100) for idx in indices[0][:5]]
-        description = f"likely containing {', '.join([pred[0] for pred in top5_preds])}"
-        return description
-    except FileNotFoundError:
-        return f"Error: Image file not found at '{image_path}'."
-    except Exception as e:
-        return f"Error processing image '{image_path}' for object detection: {e}"
-
 def process_image_text(image_path):
-    if reader is None:
-        return "Error: easyocr not initialized."
+    if reader is None or not image_path or not os.path.exists(image_path):
+        return None
     try:
         result = reader.readtext(image_path)
         if result:
@@ -118,86 +41,89 @@ def get_college_name_from_location(location_str):
     try:
         college = None
         if "," in location_str:
-            lat_str, lon_str = location_str.split(',')
             try:
-                latitude = float(lat_str.strip())
-                longitude = float(lon_str.strip())
+                latitude = float(location_str.split(',')[0].strip())
+                longitude = float(location_str.split(',')[1].strip())
                 location = geolocator.reverse((latitude, longitude), exactly_one=True, language="en")
                 if location and location.raw.get('address'):
                     address = location.raw['address']
                     college = address.get('university') or address.get('college')
             except ValueError:
-                return "Error: Invalid latitude/longitude format."
+                pass
+            except GeocoderTimedOut:
+                return "Error: Geocoding service timed out."
+            except GeocoderServiceError as e:
+                return f"Error with geocoding service: {e}"
         else:
-            location = geolocator.geocode(location_str, exactly_one=True, language="en")
-            if location and location.raw.get('address'):
-                address = location.raw['address']
-                college = address.get('university') or address.get('college')
-
-        return college if college else location_str  # Return location if college not found
-    except (GeocoderTimedOut, GeocoderServiceError) as e:
-        return f"Error with geocoding service: {e}"
+            try:
+                location = geolocator.geocode(location_str, exactly_one=True, language="en")
+                if location and location.raw.get('address'):
+                    address = location.raw['address']
+                    college = address.get('university') or address.get('college')
+            except GeocoderTimedOut:
+                return "Error: Geocoding service timed out."
+            except GeocoderServiceError as e:
+                return f"Error with geocoding service: {e}"
+        return college if college else location_str
     except Exception as e:
         return f"An unexpected error occurred during geocoding: {e}"
 
-def generate_report_prompt(inputs):
+def generate_report_prompt(college_name, event_name, location, feedback, image_paths):
     report_parts = []
 
-    event_name = inputs.get('event_name', 'the event')
-    college_name = inputs.get('college_name', 'the institution')
     report_parts.append(f"The {event_name} event, hosted by {college_name},")
 
-    image_details = []
-    if 'images' in inputs and inputs['images']:
-        for i, image_path in enumerate(inputs['images']):
-            details = []
-            if inputs.get('recognize_text', False):
-                text_description = process_image_text(image_path)
-                details.append(f"text recognition {text_description}")
-            if details:
-                image_details.append(" and ".join(details))
+    image_descriptions = []
+    if image_paths:
+        for image_path in image_paths:
+            text_description = process_image_text(image_path)
+            if text_description:
+                image_descriptions.append(text_description)
 
-        if image_details:
-            report_parts.append(f"appears to have involved elements as indicated by {', '.join(image_details)}.")
+        if image_descriptions:
+            report_parts.append(f"appears to have involved elements as {', and '.join(image_descriptions)}.")
         else:
-            report_parts.append("appears to have occurred.")
-
+            report_parts.append("appears to have involved visual elements.")
     else:
         report_parts.append("appears to have occurred.")
 
     location_info = None
-    if 'location' in inputs:
-        location_str = inputs['location']
-        resolved_college_name = get_college_name_from_location(location_str)
-        if resolved_college_name and resolved_college_name.lower() != college_name.lower() and "[College name not found based on location]" not in resolved_college_name and "Error" not in resolved_college_name:
-            location_info = f"The provided location for the event was {location_str} in {resolved_college_name}."
+    if location:
+        resolved_college_name = get_college_name_from_location(location)
+        if resolved_college_name and resolved_college_name.lower() != college_name.lower() and "Error" not in resolved_college_name:
+            location_info = f"The provided location was {location}, possibly at or near {resolved_college_name}."
         else:
-            location_info = f"The provided location for the event was {location_str}."
+            location_info = f"The event took place at {location}."
         report_parts.append(location_info)
-    elif college_name != '[College Name not provided]':
+    elif college_name:
         report_parts.append(f"The event was hosted at {college_name}.")
 
-    if 'feedback' in inputs:
-        report_parts.append(f"User feedback noted: \"{inputs['feedback']}\".")
+    if feedback:
+        report_parts.append(f"User feedback noted: \"{feedback}\".")
 
     final_prompt = " ".join(report_parts)
-    return final_prompt + " Please generate a detailed report summarizing these details in a natural-sounding paragraph with more than 2 or 3 paragraphs"
+    return final_prompt + " Please generate a detailed report summarizing these details in a natural-sounding paragraph with more than 2 or 3 paragraphs."
 
-def generate_and_save_api_report(final_prompt):
+def generate_and_save_api_report(prompt):
+    print("\n--- Inside generate_and_save_api_report ---")
+    print(f"Prompt being sent to API: {prompt}")
     try:
         completion = client.chat.completions.create(
             model=MODEL_NAME,
             messages=[
-                {"role": "user", "content": final_prompt}
+                {"role": "user", "content": prompt}
             ]
         )
+        print("\n--- API Response Received ---")
+        print(f"Completion object: {completion}") # Print the entire response object
 
         if completion and completion.choices and len(completion.choices) > 0 and completion.choices[0].message:
             generated_report = completion.choices[0].message.content.strip()
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            os.makedirs("generated_reports", exist_ok=True)
             filename = f"generated_reports/api_report_{timestamp}.txt"
             try:
-                with open(filename, "w") as outfile:
+                with open(filename, "w", encoding="utf-8") as outfile:
                     outfile.write(generated_report)
                 print(f"\nAPI Generated Report saved to '{filename}'")
                 return os.path.abspath(filename)  # Return the full path
@@ -207,7 +133,7 @@ def generate_and_save_api_report(final_prompt):
         else:
             print("Error: Could not retrieve a valid report from the API.")
             if completion:
-                print(f"Completion object: {completion}")
+                print(f"Completion details (JSON): {json.dumps(completion.model_dump_json(), indent=2)}")
             else:
                 print("Completion object is None.")
             return None
@@ -216,23 +142,32 @@ def generate_and_save_api_report(final_prompt):
         print(f"An error occurred during API call: {e}")
         return None
 
-def generate_report(data):
-    prompt = generate_report_prompt(data)
+def generate_report(college, event, location, feedback, image_paths):
+    print("\n--- Inside generate_report function ---")
+    print(f"College: {college}, Event: {event}, Location: {location}, Feedback: {feedback}, Image Paths: {image_paths}")
+    prompt = generate_report_prompt(college, event, location, feedback, image_paths)
     print("\n--- Generated Prompt for API ---")
     print(prompt)
     return generate_and_save_api_report(prompt)
 
 if __name__ == "__main__":
     # This block is for direct execution of report_gen.py (for testing)
-    # You would typically run app.py for the web application
     inputs = {
-        "event_name": "Sample Event",
-        "college_name": "Sample College",
-        "images": ["C:\\Users\\jyoth\\OneDrive\\Desktop\\miniproject1\\Img.jpg"],  # Replace with an actual image path for testing
-        "recognize_text": True,
-        "feedback": "Positive event.",
-        "location": "Hyderabad"
+        "event_name": "Test Event",
+        "college_name": "Test College",
+        "image_paths": ["uploads/your_image1.jpg", "uploads/your_image2.jpg"],  # List of test image paths
+        "feedback": "The event was well-received.",
+        "location": "Test Location"
     }
-    report_path = generate_report(inputs)
+    # Create dummy uploads directory and dummy image files for testing
+    os.makedirs("uploads", exist_ok=True)
+    for i in range(1, 3):
+        try:
+            with open(f"uploads/your_image{i}.jpg", "w") as f:
+                f.write("")
+        except Exception as e:
+            print(f"Warning: Could not create dummy test image {i}: {e}")
+
+    report_path = generate_report(**inputs)
     if report_path:
         print(f"Report generated and saved at: {report_path}")
