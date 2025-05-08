@@ -1,173 +1,200 @@
-from openai import OpenAI
 import os
-import easyocr  # Import the easyocr library
+import torch
+import requests
+import easyocr
+import warnings
+from PIL import Image
 from datetime import datetime
 from geopy.geocoders import Nominatim
-from geopy.exc import GeocoderTimedOut, GeocoderServiceError
-import json  # Import the json library for debugging API response
+import torchvision.transforms as transforms
+import torchvision.models as models
+import platform
+import subprocess
 
-client = OpenAI(
-    base_url="https://openrouter.ai/api/v1",
-    api_key="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",
-)
-MODEL_NAME = "google/gemma-3-12b-it:free"
+warnings.filterwarnings("ignore")
 
-# Initialize easyocr reader ONCE
-try:
-    reader = easyocr.Reader(['en'])  # You can add other languages here, e.g., ['en', 'hi']
-except Exception as e:
-    print(f"Error initializing easyocr: {e}")
-    reader = None
+API_KEY = "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"  # Replace this
+MODEL_NAME = "google/gemma-2-9b-it:free"
+API_URL = "https://openrouter.ai/api/v1/chat/completions"
+HEADERS = {
+    "Authorization": f"Bearer {API_KEY}",
+    "Content-Type": "application/json",
+    "HTTP-Referer": "http://localhost",
+    "X-Title": "EventReportGenerator"
+}
 
-# Initialize geolocator
-geolocator = Nominatim(user_agent="multimedia_report_generator")
+reader = easyocr.Reader(['en'], gpu=False)
+geolocator = Nominatim(user_agent="event_report_generator")
 
-def process_image_text(image_path):
-    if reader is None or not image_path or not os.path.exists(image_path):
+def process_image_text(path):
+    try:
+        results = reader.readtext(path)
+        texts = [text for _, text, conf in results if conf > 0.6]
+        return ", ".join(texts) if texts else None
+    except Exception as e:
+        print(f"OCR error for {path}: {e}")
         return None
+
+def extract_image_features(image_path):
     try:
-        result = reader.readtext(image_path)
-        if result:
-            recognized_text = ", ".join([detection[1] for detection in result])
-            return f"identified \"{recognized_text}\""
-        else:
-            return "identified no specific text"
-    except FileNotFoundError:
-        return f"Error: Image file not found at '{image_path}' for text recognition."
+        model = models.resnet18(pretrained=True)
+        model.eval()
+        transform = transforms.Compose([
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                 std=[0.229, 0.224, 0.225])
+        ])
+        image = Image.open(image_path).convert('RGB')
+        image_tensor = transform(image).unsqueeze(0)
+        with torch.no_grad():
+            features = model(image_tensor)
+        return features.flatten().tolist()[:10]
     except Exception as e:
-        return f"Error processing image '{image_path}' for text recognition with easyocr: {e}"
+        print(f"Image feature extraction error for {image_path}: {e}")
+        return []
 
-def get_college_name_from_location(location_str):
+def get_college_from_location(loc):
     try:
-        college = None
-        if "," in location_str:
-            try:
-                latitude = float(location_str.split(',')[0].strip())
-                longitude = float(location_str.split(',')[1].strip())
-                location = geolocator.reverse((latitude, longitude), exactly_one=True, language="en")
-                if location and location.raw.get('address'):
-                    address = location.raw['address']
-                    college = address.get('university') or address.get('college')
-            except ValueError:
-                pass
-            except GeocoderTimedOut:
-                return "Error: Geocoding service timed out."
-            except GeocoderServiceError as e:
-                return f"Error with geocoding service: {e}"
+        if "," in loc and all(part.strip().replace('.', '', 1).isdigit() for part in loc.split(',')):
+            lat, lon = map(float, loc.split(','))
+            place = geolocator.reverse((lat, lon), exactly_one=True, language='en')
         else:
-            try:
-                location = geolocator.geocode(location_str, exactly_one=True, language="en")
-                if location and location.raw.get('address'):
-                    address = location.raw['address']
-                    college = address.get('university') or address.get('college')
-            except GeocoderTimedOut:
-                return "Error: Geocoding service timed out."
-            except GeocoderServiceError as e:
-                return f"Error with geocoding service: {e}"
-        return college if college else location_str
+            place = geolocator.geocode(loc, exactly_one=True, language='en')
+
+        if place and 'address' in place.raw:
+            addr = place.raw['address']
+            return addr.get('university') or addr.get('college') or f"{addr.get('city', '')}, {addr.get('state', '')}".strip(", ")
+        return loc
     except Exception as e:
-        return f"An unexpected error occurred during geocoding: {e}"
+        print(f"Geolocation error for '{loc}': {e}")
+        return loc
 
-def generate_report_prompt(college_name, event_name, location, feedback, image_paths):
-    report_parts = []
+def generate_prompt(data):
+    event = data.get('event_name')
+    college = data.get('college_name')
+    location_detail = data.get('location', '')
+    location_near = get_college_from_location(location_detail) if location_detail else ''
+    feedback = data.get('feedback', '')
+    image_texts = data.get('image_texts', [])
+    image_features = data.get('image_features', [])
 
-    report_parts.append(f"The {event_name} event, hosted by {college_name},")
+    if not event or not college:
+        return None
 
-    image_descriptions = []
-    if image_paths:
-        for image_path in image_paths:
-            text_description = process_image_text(image_path)
-            if text_description:
-                image_descriptions.append(text_description)
+    prompt = (
+        f"Write a formal, well-structured institutional event report with clear and professional language in 50 words:\n\n"
+        f"Event Name: {event}\n"
+        f"Institution: {college}\n"
+        f"Location: {location_detail} ({location_near})\n"
+        f"Image Texts: {', '.join(image_texts) if image_texts else 'None'}\n"
+        f"Image Features: {', '.join(map(str, image_features)) if image_features else 'None'}\n"
+        f"Feedback: {feedback if feedback else 'None'}\n\n"
+        f"Instructions:\n"
+        f"- Use a Markdown heading '## {event} Event Report'.\n"
+        f"- Describe the successful conduct of the event by the institution.\n"
+        f"- Mention the event’s atmosphere, participation, and any visible themes.\n"
+        f"- Include location details and relevant insights from feedback.\n"
+        f"- Avoid including specific dates or club names unless provided.\n"
+        f"- Ensure the report sounds like a formal institutional summary."
+    )
+    return prompt
 
-        if image_descriptions:
-            report_parts.append(f"appears to have involved elements as {', and '.join(image_descriptions)}.")
-        else:
-            report_parts.append("appears to have involved visual elements.")
-    else:
-        report_parts.append("appears to have occurred.")
-
-    location_info = None
-    if location:
-        resolved_college_name = get_college_name_from_location(location)
-        if resolved_college_name and resolved_college_name.lower() != college_name.lower() and "Error" not in resolved_college_name:
-            location_info = f"The provided location was {location}, possibly at or near {resolved_college_name}."
-        else:
-            location_info = f"The event took place at {location}."
-        report_parts.append(location_info)
-    elif college_name:
-        report_parts.append(f"The event was hosted at {college_name}.")
-
-    if feedback:
-        report_parts.append(f"User feedback noted: \"{feedback}\".")
-
-    final_prompt = " ".join(report_parts)
-    return final_prompt + " Please generate a detailed report summarizing these details in a natural-sounding paragraph with more than 2 or 3 paragraphs."
-
-def generate_and_save_api_report(prompt):
-    print("\n--- Inside generate_and_save_api_report ---")
-    print(f"Prompt being sent to API: {prompt}")
+def send_prompt(prompt):
     try:
-        completion = client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=[
-                {"role": "user", "content": prompt}
-            ]
-        )
-        print("\n--- API Response Received ---")
-        print(f"Completion object: {completion}") # Print the entire response object
+        response = requests.post(API_URL, headers=HEADERS, json={
+            "model": MODEL_NAME,
+            "messages": [{"role": "user", "content": prompt}]
+        })
+        response.raise_for_status()
+        data = response.json()
+        return data['choices'][0]['message']['content'].strip() if 'choices' in data else None
+    except Exception as e:
+        print(f"API call failed: {e}")
+        return None
 
-        if completion and completion.choices and len(completion.choices) > 0 and completion.choices[0].message:
-            generated_report = completion.choices[0].message.content.strip()
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            os.makedirs("generated_reports", exist_ok=True)
-            filename = f"generated_reports/api_report_{timestamp}.txt"
-            try:
-                with open(filename, "w", encoding="utf-8") as outfile:
-                    outfile.write(generated_report)
-                print(f"\nAPI Generated Report saved to '{filename}'")
-                return os.path.abspath(filename)  # Return the full path
-            except Exception as e:
-                print(f"Error saving API generated report to file: {e}")
-                return None
-        else:
-            print("Error: Could not retrieve a valid report from the API.")
-            if completion:
-                print(f"Completion details (JSON): {json.dumps(completion.model_dump_json(), indent=2)}")
+def check_accuracy(report, data):
+    def normalize(txt): return txt.lower().strip()
+    report_text = normalize(report)
+    total, match = 0, 0
+
+    for key in ['event_name', 'college_name', 'location', 'feedback']:
+        val = data.get(key)
+        if val:
+            total += 1
+            val_norm = normalize(val)
+            if key == 'location':
+                alt_loc = normalize(get_college_from_location(val))
+                if val_norm in report_text or alt_loc in report_text:
+                    match += 1
+            elif key == 'feedback':
+                words = val_norm.split()
+                if sum(1 for w in words if w in report_text) / len(words) >= 0.4:
+                    match += 1
             else:
-                print("Completion object is None.")
+                if val_norm in report_text:
+                    match += 1
+    return round(match / total, 2) if total > 0 else 1.0
+
+def save_report(report):
+    try:
+        filename = f"report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        with open(filename, 'w', encoding='utf-8') as f:
+            f.write(report)
+        print(f"Report saved to {filename}")
+        return os.path.abspath(filename)
+    except Exception as e:
+        print(f"Error saving report: {e}")
+        return None
+
+def open_report_file(path):
+    if not path:
+        return
+    try:
+        if platform.system() == 'Darwin':
+            subprocess.run(['open', path])
+        elif platform.system() == 'Windows':
+            subprocess.run(['start', path], shell=True)
+        else:
+            subprocess.run(['xdg-open', path])
+    except Exception as e:
+        print(f"Failed to open file: {e}")
+
+def generate_report(college_name, event_name, location, feedback, image_paths):
+    try:
+        image_texts = []
+        image_features = []
+        for path in image_paths:
+            image_texts.append(process_image_text(path) or 'None')
+            image_features.append(extract_image_features(path))
+
+        data = {
+            "college_name": college_name,
+            "event_name": event_name,
+            "location": location,
+            "feedback": feedback,
+            "image_texts": image_texts,
+            "image_features": image_features
+        }
+
+        prompt = generate_prompt(data)
+        if not prompt:
+            print("Missing required input data.")
             return None
 
+        report = send_prompt(prompt)
+        if not report:
+            print("Report generation failed.")
+            return None
+
+        accuracy = check_accuracy(report, data)
+        print(f"Generated report with accuracy: {accuracy * 100:.1f}%")
+
+        report_path = save_report(report)
+        open_report_file(report_path)
+        return report_path
+
     except Exception as e:
-        print(f"An error occurred during API call: {e}")
+        print(f"Report generation error: {e}")
         return None
-
-def generate_report(college, event, location, feedback, image_paths):
-    print("\n--- Inside generate_report function ---")
-    print(f"College: {college}, Event: {event}, Location: {location}, Feedback: {feedback}, Image Paths: {image_paths}")
-    prompt = generate_report_prompt(college, event, location, feedback, image_paths)
-    print("\n--- Generated Prompt for API ---")
-    print(prompt)
-    return generate_and_save_api_report(prompt)
-
-if __name__ == "__main__":
-    # This block is for direct execution of report_gen.py (for testing)
-    inputs = {
-        "event_name": "Test Event",
-        "college_name": "Test College",
-        "image_paths": ["uploads/your_image1.jpg", "uploads/your_image2.jpg"],  # List of test image paths
-        "feedback": "The event was well-received.",
-        "location": "Test Location"
-    }
-    # Create dummy uploads directory and dummy image files for testing
-    os.makedirs("uploads", exist_ok=True)
-    for i in range(1, 3):
-        try:
-            with open(f"uploads/your_image{i}.jpg", "w") as f:
-                f.write("")
-        except Exception as e:
-            print(f"Warning: Could not create dummy test image {i}: {e}")
-
-    report_path = generate_report(**inputs)
-    if report_path:
-        print(f"Report generated and saved at: {report_path}")

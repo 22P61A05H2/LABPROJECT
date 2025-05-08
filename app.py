@@ -1,46 +1,78 @@
-from flask import Flask, render_template, request, send_file
-from report_gen import generate_report
+from flask import Flask, request, render_template
 import os
-from werkzeug.utils import secure_filename
+import json
+import mysql.connector
+from report_gen import generate_report
 
 app = Flask(__name__)
-app.config['UPLOAD_FOLDER'] = 'uploads'
-os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+UPLOAD_FOLDER = 'uploads'
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+# MySQL database connection
+db = mysql.connector.connect(
+    host="localhost",
+    user="root",        # Replace with your MySQL username
+    password="Adithya@2005",# Replace with your MySQL password
+    database="project1"
+)
+cursor = db.cursor()
 
 @app.route('/')
-def form():
-    return render_template('genrepo.html') # Replace with your actual HTML file name
+def index():
+    return render_template('genrepo.html')
 
 @app.route('/submit', methods=['POST'])
 def submit():
-    college = request.form.get('collegeName', '')
-    event = request.form.get('eventName', '')
-    location = request.form.get('location', '')
-    feedback = request.form.get('feedback', '')
-    images = request.files.getlist('images') # Get a list of uploaded files
-    image_paths = []
+    try:
+        # Get form inputs
+        college = request.form.get('collegeName')
+        event = request.form.get('eventName')
+        location = request.form.get('location')
+        feedback = request.form.get('feedback')
 
-    for image in images:
-        if image and allowed_file(image.filename):
-            filename = secure_filename(image.filename)
-            image_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-            try:
-                image.save(image_path)
-                image_paths.append(image_path)
-            except Exception as e:
-                print(f"Error saving image {filename}: {e}")
+        image_files = request.files.getlist('images')
+        image_paths = []
+        image_filenames = []
 
-    # Generate report
-    print("\n--- Calling generate_report from app.py ---")
-    report_path = generate_report(college=college, event=event, location=location, feedback=feedback, image_paths=image_paths)
+        # Save uploaded images
+        for image in image_files:
+            if image.filename != '':
+                filepath = os.path.join(UPLOAD_FOLDER, image.filename)
+                image.save(filepath)
+                image_paths.append(filepath)
+                image_filenames.append(image.filename)
 
-    if report_path:
-        return send_file(report_path, as_attachment=True)
-    else:
-        return "Error generating report.", 500
+        # Insert into event_inputs table
+        insert_input = """
+            INSERT INTO event_inputs (college_name, event_name, location, feedback, images)
+            VALUES (%s, %s, %s, %s, %s)
+        """
+        cursor.execute(insert_input, (college, event, location, feedback, json.dumps(image_filenames)))
+        db.commit()
+        input_id = cursor.lastrowid  # Get the inserted input row ID
 
-def allowed_file(filename):
-    return '.' in filename and filename.rsplit('.', 1)[1].lower() in {'png', 'jpg', 'jpeg'}
+        # Generate the report
+        print("\n--- Calling generate_report from app.py ---")
+        report_path, report_content = generate_report(college, event, location, feedback, image_paths)
+
+        # Debugging: Ensure report_content is not None
+        print(f"Generated report content: {report_content}")
+        
+        # Only save the report if it was successfully generated
+        if report_content:
+            insert_report = "INSERT INTO event_reports (input_id, report) VALUES (%s, %s)"
+            cursor.execute(insert_report, (input_id, report_content))
+            db.commit()
+            print(f"Report saved to event_reports with input_id {input_id}")
+
+        if report_path:
+            return f"<h3>Report generated and saved successfully!</h3><p>Saved to: {report_path}</p>"
+        else:
+            return "<h3>Report generation failed. Try again with better inputs.</h3>"
+
+    except Exception as e:
+        print(f"Exception in /submit route: {e}")
+        return "<h3>Something went wrong. Please check your input and try again.</h3>"
 
 if __name__ == '__main__':
     app.run(debug=True)
