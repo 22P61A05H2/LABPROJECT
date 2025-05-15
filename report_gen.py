@@ -13,7 +13,7 @@ import subprocess
 
 warnings.filterwarnings("ignore")
 
-API_KEY = "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"  # Replace this
+API_KEY = "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"  # Replace this
 MODEL_NAME = "google/gemma-2-9b-it:free"
 API_URL = "https://openrouter.ai/api/v1/chat/completions"
 HEADERS = {
@@ -84,7 +84,7 @@ def generate_prompt(data):
         return None
 
     prompt = (
-        f"Write a formal, well-structured institutional event report with clear and professional language in 50 words:\n\n"
+        f"Write a formal, well-structured institutional event report with clear and professional language in 50 words and 75% accuracy:\n\n"
         f"Event Name: {event}\n"
         f"Institution: {college}\n"
         f"Location: {location_detail} ({location_near})\n"
