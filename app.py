@@ -11,9 +11,9 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 # MySQL database connection
 db = mysql.connector.connect(
     host="localhost",
-    user="root",        # Replace with your MySQL username
-    password="Adithya@2005",# Replace with your MySQL password
-    database="project1"
+    user="root",  # Replace with your MySQL username
+    password="Adithya@2005",  # Replace with your MySQL password
+    database="miniproject"
 )
 cursor = db.cursor()
 
@@ -49,23 +49,18 @@ def submit():
         """
         cursor.execute(insert_input, (college, event, location, feedback, json.dumps(image_filenames)))
         db.commit()
-        input_id = cursor.lastrowid  # Get the inserted input row ID
+        input_id = cursor.lastrowid
 
-        # Generate the report
+        # Generate the report and get only the file path
         print("\n--- Calling generate_report from app.py ---")
-        report_path, report_content = generate_report(college, event, location, feedback, image_paths)
-
-        # Debugging: Ensure report_content is not None
-        print(f"Generated report content: {report_content}")
-        
-        # Only save the report if it was successfully generated
-        if report_content:
-            insert_report = "INSERT INTO event_reports (input_id, report) VALUES (%s, %s)"
-            cursor.execute(insert_report, (input_id, report_content))
-            db.commit()
-            print(f"Report saved to event_reports with input_id {input_id}")
+        report_path = generate_report(college, event, location, feedback, image_paths)
 
         if report_path:
+            # Insert only the path into event_reports
+            insert_report = "INSERT INTO event_reports (input_id, report_path) VALUES (%s, %s)"
+            cursor.execute(insert_report, (input_id, report_path))
+            db.commit()
+            print(f"Report path saved to event_reports with input_id {input_id}")
             return f"<h3>Report generated and saved successfully!</h3><p>Saved to: {report_path}</p>"
         else:
             return "<h3>Report generation failed. Try again with better inputs.</h3>"
